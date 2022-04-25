@@ -5,19 +5,12 @@ class Akismet {
 	const API_PORT = 80;
 	const MAX_DELAY_BEFORE_MODERATION_EMAIL = 86400; // One day in seconds
 
-	public static $limit_notices = array(
-		10501 => 'FIRST_MONTH_OVER_LIMIT',
-		10502 => 'SECOND_MONTH_OVER_LIMIT',
-		10504 => 'THIRD_MONTH_APPROACHING_LIMIT',
-		10508 => 'THIRD_MONTH_OVER_LIMIT',
-		10516 => 'FOUR_PLUS_MONTHS_OVER_LIMIT',
-	);
-
 	private static $last_comment = '';
 	private static $initiated = false;
 	private static $prevent_moderation_email_for_these_comments = array();
 	private static $last_comment_result = null;
 	private static $comment_as_submitted_allowed_keys = array( 'blog' => '', 'blog_charset' => '', 'blog_lang' => '', 'blog_ua' => '', 'comment_agent' => '', 'comment_author' => '', 'comment_author_IP' => '', 'comment_author_email' => '', 'comment_author_url' => '', 'comment_content' => '', 'comment_date_gmt' => '', 'comment_tags' => '', 'comment_type' => '', 'guid' => '', 'is_test' => '', 'permalink' => '', 'reporter' => '', 'site_domain' => '', 'submit_referer' => '', 'submit_uri' => '', 'user_ID' => '', 'user_agent' => '', 'user_id' => '', 'user_ip' => '' );
+	private static $is_rest_api_call = false;
 	
 	public static function init() {
 		if ( ! self::$initiated ) {
@@ -37,11 +30,14 @@ class Akismet {
 
 		add_action( 'akismet_scheduled_delete', array( 'Akismet', 'delete_old_comments' ) );
 		add_action( 'akismet_scheduled_delete', array( 'Akismet', 'delete_old_comments_meta' ) );
-		add_action( 'akismet_scheduled_delete', array( 'Akismet', 'delete_orphaned_commentmeta' ) );
 		add_action( 'akismet_schedule_cron_recheck', array( 'Akismet', 'cron_recheck' ) );
 
 		add_action( 'comment_form',  array( 'Akismet',  'add_comment_nonce' ), 1 );
-		add_action( 'comment_form', array( 'Akismet', 'output_custom_form_fields' ) );
+
+		add_action( 'admin_head-edit-comments.php', array( 'Akismet', 'load_form_js' ) );
+		add_action( 'comment_form', array( 'Akismet', 'load_form_js' ) );
+		add_action( 'comment_form', array( 'Akismet', 'inject_ak_js' ) );
+		add_filter( 'script_loader_tag', array( 'Akismet', 'set_form_js_async' ), 10, 3 );
 
 		add_filter( 'comment_moderation_recipients', array( 'Akismet', 'disable_moderation_emails_if_unreachable' ), 1000, 2 );
 		add_filter( 'pre_comment_approved', array( 'Akismet', 'last_comment_status' ), 10, 2 );
@@ -50,28 +46,10 @@ class Akismet {
 
 		// Run this early in the pingback call, before doing a remote fetch of the source uri
 		add_action( 'xmlrpc_call', array( 'Akismet', 'pre_check_pingback' ) );
-
+		
 		// Jetpack compatibility
 		add_filter( 'jetpack_options_whitelist', array( 'Akismet', 'add_to_jetpack_options_whitelist' ) );
-		add_filter( 'jetpack_contact_form_html', array( 'Akismet', 'inject_custom_form_fields' ) );
-		add_filter( 'jetpack_contact_form_akismet_values', array( 'Akismet', 'prepare_custom_form_values' ) );
-
-		// Gravity Forms
-		add_filter( 'gform_get_form_filter', array( 'Akismet', 'inject_custom_form_fields' ) );
-		add_filter( 'gform_akismet_fields', array( 'Akismet', 'prepare_custom_form_values' ) );
-
-		// Contact Form 7
-		add_filter( 'wpcf7_form_elements', array( 'Akismet', 'append_custom_form_fields' ) );
-		add_filter( 'wpcf7_akismet_parameters', array( 'Akismet', 'prepare_custom_form_values' ) );
-
-		// Formidable Forms
-		add_filter( 'frm_filter_final_form', array( 'Akismet', 'inject_custom_form_fields' ) );
-		add_filter( 'frm_akismet_values', array( 'Akismet', 'prepare_custom_form_values' ) );
-
 		add_action( 'update_option_wordpress_api_key', array( 'Akismet', 'updated_option' ), 10, 2 );
-		add_action( 'add_option_wordpress_api_key', array( 'Akismet', 'added_option' ), 10, 2 );
-
-		add_action( 'comment_form_after',  array( 'Akismet',  'display_comment_form_privacy_notice' ) );
 	}
 
 	public static function get_api_key() {
@@ -83,11 +61,6 @@ class Akismet {
 	}
 
 	public static function verify_key( $key, $ip = null ) {
-		// Shortcut for obviously invalid keys.
-		if ( strlen( $key ) != 12 ) {
-			return 'invalid';
-		}
-		
 		$response = self::check_key_status( $key, $ip );
 
 		if ( $response[1] != 'valid' && $response[1] != 'invalid' )
@@ -136,36 +109,13 @@ class Akismet {
 		}
 	}
 	
-	/**
-	 * Treat the creation of an API key the same as updating the API key to a new value.
-	 *
-	 * @param mixed  $option_name   Will always be "wordpress_api_key", until something else hooks in here.
-	 * @param mixed  $value         The option value.
-	 */
-	public static function added_option( $option_name, $value ) {
-		if ( 'wordpress_api_key' === $option_name ) {
-			return self::updated_option( '', $value );
-		}
-	}
-	
 	public static function rest_auto_check_comment( $commentdata ) {
-		return self::auto_check_comment( $commentdata, 'rest_api' );
+		self::$is_rest_api_call = true;
+		
+		return self::auto_check_comment( $commentdata );
 	}
 
-	/**
-	 * Check a comment for spam.
-	 *
-	 * @param array $commentdata
-	 * @param string $context What kind of request triggered this comment check? Possible values are 'default', 'rest_api', and 'xml-rpc'.
-	 * @return array|WP_Error Either the $commentdata array with additional entries related to its spam status
-	 *                        or a WP_Error, if it's a REST API request and the comment should be discarded.
-	 */
-	public static function auto_check_comment( $commentdata, $context = 'default' ) {
-		// If no key is configured, then there's no point in doing any of this.
-		if ( ! self::get_api_key() ) {
-			return $commentdata;
-		}
-
+	public static function auto_check_comment( $commentdata ) {
 		self::$last_comment_result = null;
 
 		$comment = $commentdata;
@@ -231,15 +181,7 @@ class Akismet {
 		do_action( 'akismet_comment_check_response', $response );
 
 		$commentdata['comment_as_submitted'] = array_intersect_key( $comment, self::$comment_as_submitted_allowed_keys );
-
-		// Also include any form fields we inject into the comment form, like ak_js
-		foreach ( $_POST as $key => $value ) {
-			if ( is_string( $value ) && strpos( $key, 'ak_' ) === 0 ) {
-				$commentdata['comment_as_submitted'][ 'POST_' . $key ] = $value;
-			}
-		}
-
-		$commentdata['akismet_result'] = $response[1];
+		$commentdata['akismet_result']       = $response[1];
 
 		if ( isset( $response[0]['x-akismet-pro-tip'] ) )
 	        $commentdata['akismet_pro_tip'] = $response[0]['x-akismet-pro-tip'];
@@ -264,19 +206,17 @@ class Akismet {
 					update_option( 'akismet_spam_count', get_option( 'akismet_spam_count' ) + $incr );
 				}
 
-				if ( 'rest_api' === $context ) {
+				if ( self::$is_rest_api_call ) {
 					return new WP_Error( 'akismet_rest_comment_discarded', __( 'Comment discarded.', 'akismet' ) );
-				} else if ( 'xml-rpc' === $context ) {
-					// If this is a pingback that we're pre-checking, the discard behavior is the same as the normal spam response behavior.
-					return $commentdata;
-				} else {
+				}
+				else {
 					// Redirect back to the previous page, or failing that, the post permalink, or failing that, the homepage of the blog.
 					$redirect_to = isset( $_SERVER['HTTP_REFERER'] ) ? $_SERVER['HTTP_REFERER'] : ( $post ? get_permalink( $post ) : home_url() );
 					wp_safe_redirect( esc_url_raw( $redirect_to ) );
 					die();
 				}
 			}
-			else if ( 'rest_api' === $context ) {
+			else if ( self::$is_rest_api_call ) {
 				// The way the REST API structures its calls, we can set the comment_approved value right away.
 				$commentdata['comment_approved'] = 'spam';
 			}
@@ -335,56 +275,48 @@ class Akismet {
 		// as was checked by auto_check_comment
 		if ( is_object( $comment ) && !empty( self::$last_comment ) && is_array( self::$last_comment ) ) {
 			if ( self::matches_last_comment( $comment ) ) {
-				load_plugin_textdomain( 'akismet' );
-
-				// normal result: true or false
-				if ( self::$last_comment['akismet_result'] == 'true' ) {
-					update_comment_meta( $comment->comment_ID, 'akismet_result', 'true' );
-					self::update_comment_history( $comment->comment_ID, '', 'check-spam' );
-					if ( $comment->comment_approved != 'spam' ) {
+					
+					load_plugin_textdomain( 'akismet' );
+					
+					// normal result: true or false
+					if ( self::$last_comment['akismet_result'] == 'true' ) {
+						update_comment_meta( $comment->comment_ID, 'akismet_result', 'true' );
+						self::update_comment_history( $comment->comment_ID, '', 'check-spam' );
+						if ( $comment->comment_approved != 'spam' )
+							self::update_comment_history(
+								$comment->comment_ID,
+								'',
+								'status-changed-'.$comment->comment_approved
+							);
+					}
+					elseif ( self::$last_comment['akismet_result'] == 'false' ) {
+						update_comment_meta( $comment->comment_ID, 'akismet_result', 'false' );
+						self::update_comment_history( $comment->comment_ID, '', 'check-ham' );
+						// Status could be spam or trash, depending on the WP version and whether this change applies:
+						// https://core.trac.wordpress.org/changeset/34726
+						if ( $comment->comment_approved == 'spam' || $comment->comment_approved == 'trash' ) {
+							if ( wp_blacklist_check($comment->comment_author, $comment->comment_author_email, $comment->comment_author_url, $comment->comment_content, $comment->comment_author_IP, $comment->comment_agent) )
+								self::update_comment_history( $comment->comment_ID, '', 'wp-blacklisted' );
+							else
+								self::update_comment_history( $comment->comment_ID, '', 'status-changed-'.$comment->comment_approved );
+						}
+					} // abnormal result: error
+					else {
+						update_comment_meta( $comment->comment_ID, 'akismet_error', time() );
 						self::update_comment_history(
 							$comment->comment_ID,
 							'',
-							'status-changed-' . $comment->comment_approved
+							'check-error',
+							array( 'response' => substr( self::$last_comment['akismet_result'], 0, 50 ) )
 						);
 					}
-				} elseif ( self::$last_comment['akismet_result'] == 'false' ) {
-					update_comment_meta( $comment->comment_ID, 'akismet_result', 'false' );
-					self::update_comment_history( $comment->comment_ID, '', 'check-ham' );
-					// Status could be spam or trash, depending on the WP version and whether this change applies:
-					// https://core.trac.wordpress.org/changeset/34726
-					if ( $comment->comment_approved == 'spam' || $comment->comment_approved == 'trash' ) {
-						if ( function_exists( 'wp_check_comment_disallowed_list' ) ) {
-							if ( wp_check_comment_disallowed_list( $comment->comment_author, $comment->comment_author_email, $comment->comment_author_url, $comment->comment_content, $comment->comment_author_IP, $comment->comment_agent ) ) {
-								self::update_comment_history( $comment->comment_ID, '', 'wp-disallowed' );
-							} else {
-								self::update_comment_history( $comment->comment_ID, '', 'status-changed-' . $comment->comment_approved );
-							}
-						} else if ( function_exists( 'wp_blacklist_check' ) && wp_blacklist_check( $comment->comment_author, $comment->comment_author_email, $comment->comment_author_url, $comment->comment_content, $comment->comment_author_IP, $comment->comment_agent ) ) {
-							self::update_comment_history( $comment->comment_ID, '', 'wp-blacklisted' );
-						} else {
-							self::update_comment_history( $comment->comment_ID, '', 'status-changed-' . $comment->comment_approved );
-						}
-					}
-				} else {
-					 // abnormal result: error
-					update_comment_meta( $comment->comment_ID, 'akismet_error', time() );
-					self::update_comment_history(
-						$comment->comment_ID,
-						'',
-						'check-error',
-						array( 'response' => substr( self::$last_comment['akismet_result'], 0, 50 ) )
-					);
-				}
 
-				// record the complete original data as submitted for checking
-				if ( isset( self::$last_comment['comment_as_submitted'] ) ) {
-					update_comment_meta( $comment->comment_ID, 'akismet_as_submitted', self::$last_comment['comment_as_submitted'] );
-				}
+					// record the complete original data as submitted for checking
+					if ( isset( self::$last_comment['comment_as_submitted'] ) )
+						update_comment_meta( $comment->comment_ID, 'akismet_as_submitted', self::$last_comment['comment_as_submitted'] );
 
-				if ( isset( self::$last_comment['akismet_pro_tip'] ) ) {
-					update_comment_meta( $comment->comment_ID, 'akismet_pro_tip', self::$last_comment['akismet_pro_tip'] );
-				}
+					if ( isset( self::$last_comment['akismet_pro_tip'] ) )
+						update_comment_meta( $comment->comment_ID, 'akismet_pro_tip', self::$last_comment['akismet_pro_tip'] );
 			}
 		}
 	}
@@ -414,13 +346,8 @@ class Akismet {
 
 			$wpdb->queries = array();
 
-			$comments = array();
-
 			foreach ( $comment_ids as $comment_id ) {
-				$comments[ $comment_id ] = get_comment( $comment_id );
-
-				do_action( 'delete_comment', $comment_id, $comments[ $comment_id ] );
-				do_action( 'akismet_batch_delete_count', __FUNCTION__ );
+				do_action( 'delete_comment', $comment_id );
 			}
 
 			// Prepared as strings since comment_id is an unsigned BIGINT, and using %d will constrain the value to the maximum signed BIGINT.
@@ -428,11 +355,6 @@ class Akismet {
 
 			$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->comments} WHERE comment_id IN ( " . $format_string . " )", $comment_ids ) );
 			$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->commentmeta} WHERE comment_id IN ( " . $format_string . " )", $comment_ids ) );
-
-			foreach ( $comment_ids as $comment_id ) {
-				do_action( 'deleted_comment', $comment_id, $comments[ $comment_id ] );
-				unset( $comments[ $comment_id ] );
-			}
 
 			clean_comment_cache( $comment_ids );
 			do_action( 'akismet_delete_comment_batch', count( $comment_ids ) );
@@ -447,7 +369,7 @@ class Akismet {
 
 		$interval = apply_filters( 'akismet_delete_commentmeta_interval', 15 );
 
-		# enforce a minimum of 1 day
+		# enfore a minimum of 1 day
 		$interval = absint( $interval );
 		if ( $interval < 1 )
 			$interval = 1;
@@ -462,47 +384,9 @@ class Akismet {
 
 			foreach ( $comment_ids as $comment_id ) {
 				delete_comment_meta( $comment_id, 'akismet_as_submitted' );
-				do_action( 'akismet_batch_delete_count', __FUNCTION__ );
 			}
 
 			do_action( 'akismet_delete_commentmeta_batch', count( $comment_ids ) );
-		}
-
-		if ( apply_filters( 'akismet_optimize_table', ( mt_rand(1, 5000) == 11), $wpdb->commentmeta ) ) // lucky number
-			$wpdb->query("OPTIMIZE TABLE {$wpdb->commentmeta}");
-	}
-
-	// Clear out comments meta that no longer have corresponding comments in the database
-	public static function delete_orphaned_commentmeta() {
-		global $wpdb;
-
-		$last_meta_id = 0;
-		$start_time = isset( $_SERVER['REQUEST_TIME_FLOAT'] ) ? $_SERVER['REQUEST_TIME_FLOAT'] : microtime( true );
-		$max_exec_time = max( ini_get('max_execution_time') - 5, 3 );
-
-		while ( $commentmeta_results = $wpdb->get_results( $wpdb->prepare( "SELECT m.meta_id, m.comment_id, m.meta_key FROM {$wpdb->commentmeta} as m LEFT JOIN {$wpdb->comments} as c USING(comment_id) WHERE c.comment_id IS NULL AND m.meta_id > %d ORDER BY m.meta_id LIMIT 1000", $last_meta_id ) ) ) {
-			if ( empty( $commentmeta_results ) )
-				return;
-
-			$wpdb->queries = array();
-
-			$commentmeta_deleted = 0;
-
-			foreach ( $commentmeta_results as $commentmeta ) {
-				if ( 'akismet_' == substr( $commentmeta->meta_key, 0, 8 ) ) {
-					delete_comment_meta( $commentmeta->comment_id, $commentmeta->meta_key );
-					do_action( 'akismet_batch_delete_count', __FUNCTION__ );
-					$commentmeta_deleted++;
-				}
-
-				$last_meta_id = $commentmeta->meta_id;
-			}
-
-			do_action( 'akismet_delete_commentmeta_batch', $commentmeta_deleted );
-
-			// If we're getting close to max_execution_time, quit for this round.
-			if ( microtime(true) - $start_time > $max_exec_time )
-				return;
 		}
 
 		if ( apply_filters( 'akismet_optimize_table', ( mt_rand(1, 5000) == 11), $wpdb->commentmeta ) ) // lucky number
@@ -513,38 +397,11 @@ class Akismet {
 	public static function get_user_comments_approved( $user_id, $comment_author_email, $comment_author, $comment_author_url ) {
 		global $wpdb;
 
-		/**
-		 * Which comment types should be ignored when counting a user's approved comments?
-		 *
-		 * Some plugins add entries to the comments table that are not actual
-		 * comments that could have been checked by Akismet. Allow these comments
-		 * to be excluded from the "approved comment count" query in order to
-		 * avoid artificially inflating the approved comment count.
-		 *
-		 * @param array $comment_types An array of comment types that won't be considered
-		 *                             when counting a user's approved comments.
-		 *
-		 * @since 4.2.2
-		 */
-		$excluded_comment_types = apply_filters( 'akismet_excluded_comment_types', array() );
+		if ( !empty( $user_id ) )
+			return (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->comments} WHERE user_id = %d AND comment_approved = 1", $user_id ) );
 
-		$comment_type_where = '';
-
-		if ( is_array( $excluded_comment_types ) && ! empty( $excluded_comment_types ) ) {
-			$excluded_comment_types = array_unique( $excluded_comment_types );
-
-			foreach ( $excluded_comment_types as $excluded_comment_type ) {
-				$comment_type_where .= $wpdb->prepare( ' AND comment_type <> %s ', $excluded_comment_type );
-			}
-		}
-
-		if ( ! empty( $user_id ) ) {
-			return (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->comments} WHERE user_id = %d AND comment_approved = 1" . $comment_type_where, $user_id ) );
-		}
-
-		if ( ! empty( $comment_author_email ) ) {
-			return (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_author_email = %s AND comment_author = %s AND comment_author_url = %s AND comment_approved = 1" . $comment_type_where, $comment_author_email, $comment_author, $comment_author_url ) );
-		}
+		if ( !empty( $comment_author_email ) )
+			return (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_author_email = %s AND comment_author = %s AND comment_author_url = %s AND comment_approved = 1", $comment_author_email, $comment_author, $comment_author_url ) );
 
 		return 0;
 	}
@@ -552,44 +409,6 @@ class Akismet {
 	// get the full comment history for a given comment, as an array in reverse chronological order
 	public static function get_comment_history( $comment_id ) {
 		$history = get_comment_meta( $comment_id, 'akismet_history', false );
-		if ( empty( $history ) || empty( $history[ 0 ] ) ) {
-			return false;
-		}
-		
-		/*
-		// To see all variants when testing.
-		$history[] = array( 'time' => 445856401, 'message' => 'Old versions of Akismet stored the message as a literal string in the commentmeta.', 'event' => null );
-		$history[] = array( 'time' => 445856402, 'event' => 'recheck-spam' );
-		$history[] = array( 'time' => 445856403, 'event' => 'check-spam' );
-		$history[] = array( 'time' => 445856404, 'event' => 'recheck-ham' );
-		$history[] = array( 'time' => 445856405, 'event' => 'check-ham' );
-		$history[] = array( 'time' => 445856406, 'event' => 'wp-blacklisted' );
-		$history[] = array( 'time' => 445856406, 'event' => 'wp-disallowed' );
-		$history[] = array( 'time' => 445856407, 'event' => 'report-spam' );
-		$history[] = array( 'time' => 445856408, 'event' => 'report-spam', 'user' => 'sam' );
-		$history[] = array( 'message' => 'sam reported this comment as spam (hardcoded message).', 'time' => 445856400, 'event' => 'report-spam', 'user' => 'sam' );
-		$history[] = array( 'time' => 445856409, 'event' => 'report-ham', 'user' => 'sam' );
-		$history[] = array( 'message' => 'sam reported this comment as ham (hardcoded message).', 'time' => 445856400, 'event' => 'report-ham', 'user' => 'sam' ); //
-		$history[] = array( 'time' => 445856410, 'event' => 'cron-retry-spam' );
-		$history[] = array( 'time' => 445856411, 'event' => 'cron-retry-ham' );
-		$history[] = array( 'time' => 445856412, 'event' => 'check-error' ); //
-		$history[] = array( 'time' => 445856413, 'event' => 'check-error', 'meta' => array( 'response' => 'The server was taking a nap.' ) );
-		$history[] = array( 'time' => 445856414, 'event' => 'recheck-error' ); // Should not generate a message.
-		$history[] = array( 'time' => 445856415, 'event' => 'recheck-error', 'meta' => array( 'response' => 'The server was taking a nap.' ) );
-		$history[] = array( 'time' => 445856416, 'event' => 'status-changedtrash' );
-		$history[] = array( 'time' => 445856417, 'event' => 'status-changedspam' );
-		$history[] = array( 'time' => 445856418, 'event' => 'status-changedhold' );
-		$history[] = array( 'time' => 445856419, 'event' => 'status-changedapprove' );
-		$history[] = array( 'time' => 445856420, 'event' => 'status-changed-trash' );
-		$history[] = array( 'time' => 445856421, 'event' => 'status-changed-spam' );
-		$history[] = array( 'time' => 445856422, 'event' => 'status-changed-hold' );
-		$history[] = array( 'time' => 445856423, 'event' => 'status-changed-approve' );
-		$history[] = array( 'time' => 445856424, 'event' => 'status-trash', 'user' => 'sam' );
-		$history[] = array( 'time' => 445856425, 'event' => 'status-spam', 'user' => 'sam' );
-		$history[] = array( 'time' => 445856426, 'event' => 'status-hold', 'user' => 'sam' );
-		$history[] = array( 'time' => 445856427, 'event' => 'status-approve', 'user' => 'sam' );
-		*/
-		
 		usort( $history, array( 'Akismet', '_cmp_time' ) );
 		return $history;
 	}
@@ -626,10 +445,6 @@ class Akismet {
 
 	public static function check_db_comment( $id, $recheck_reason = 'recheck_queue' ) {
 		global $wpdb;
-
-		if ( ! self::get_api_key() ) {
-			return new WP_Error( 'akismet-not-configured', __( 'Akismet is not configured. Please enter an API key.', 'akismet' ) );
-		}
 
 		$c = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$wpdb->comments} WHERE comment_ID = %d", $id ), ARRAY_A );
 		
@@ -705,11 +520,6 @@ class Akismet {
 		if ( $new_status == $old_status )
 			return;
 
-		if ( 'spam' === $new_status || 'spam' === $old_status ) {
-			// Clear the cache of the "X comments in your spam queue" count on the dashboard.
-			wp_cache_delete( 'akismet_spam_count', 'widget' );
-		}
-
 		# we don't need to record a history item for deleted comments
 		if ( $new_status == 'delete' )
 			return;
@@ -778,13 +588,6 @@ class Akismet {
 		if ( 'spam' != $comment->comment_approved )
 			return;
 
-		self::update_comment_history( $comment_id, '', 'report-spam' );
-
-		// If the user hasn't configured Akismet, there's nothing else to do at this point.
-		if ( ! self::get_api_key() ) {
-			return;
-		}
-
 		// use the original version stored in comment_meta if available
 		$as_submitted = self::sanitize_comment_as_submitted( get_comment_meta( $comment_id, 'akismet_as_submitted', true ) );
 
@@ -817,10 +620,9 @@ class Akismet {
 		}
 
 		$response = Akismet::http_post( Akismet::build_query( $comment ), 'submit-spam' );
-
-		update_comment_meta( $comment_id, 'akismet_user_result', 'true' );
-
 		if ( $comment->reporter ) {
+			self::update_comment_history( $comment_id, '', 'report-spam' );
+			update_comment_meta( $comment_id, 'akismet_user_result', 'true' );
 			update_comment_meta( $comment_id, 'akismet_user', $comment->reporter );
 		}
 
@@ -835,13 +637,6 @@ class Akismet {
 		$comment = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$wpdb->comments} WHERE comment_ID = %d", $comment_id ) );
 		if ( !$comment ) // it was deleted
 			return;
-
-		self::update_comment_history( $comment_id, '', 'report-ham' );
-
-		// If the user hasn't configured Akismet, there's nothing else to do at this point.
-		if ( ! self::get_api_key() ) {
-			return;
-		}
 
 		// use the original version stored in comment_meta if available
 		$as_submitted = self::sanitize_comment_as_submitted( get_comment_meta( $comment_id, 'akismet_as_submitted', true ) );
@@ -875,10 +670,9 @@ class Akismet {
 		}
 
 		$response = self::http_post( Akismet::build_query( $comment ), 'submit-ham' );
-
-		update_comment_meta( $comment_id, 'akismet_user_result', 'false' );
-
 		if ( $comment->reporter ) {
+			self::update_comment_history( $comment_id, '', 'report-ham' );
+			update_comment_meta( $comment_id, 'akismet_user_result', 'false' );
 			update_comment_meta( $comment_id, 'akismet_user', $comment->reporter );
 		}
 
@@ -907,12 +701,7 @@ class Akismet {
 		foreach ( (array) $comment_errors as $comment_id ) {
 			// if the comment no longer exists, or is too old, remove the meta entry from the queue to avoid getting stuck
 			$comment = get_comment( $comment_id );
-
-			if (
-				! $comment // Comment has been deleted
-				|| strtotime( $comment->comment_date_gmt ) < strtotime( "-15 days" ) // Comment is too old.
-				|| $comment->comment_approved !== "0" // Comment is no longer in the Pending queue
-				) {
+			if ( !$comment || strtotime( $comment->comment_date_gmt ) < strtotime( "-15 days" ) ) {
 				delete_comment_meta( $comment_id, 'akismet_error' );
 				delete_comment_meta( $comment_id, 'akismet_delayed_moderation_email' );
 				continue;
@@ -1001,11 +790,6 @@ class Akismet {
 		 * has not been set and that Akismet should just choose the default behavior for that
 		 * situation.
 		 */
-		
-		if ( ! self::get_api_key() ) {
-			return;
-		}
-		
 		$akismet_comment_nonce_option = apply_filters( 'akismet_comment_nonce', get_option( 'akismet_comment_nonce' ) );
 
 		if ( $akismet_comment_nonce_option == 'true' || $akismet_comment_nonce_option == '' ) {
@@ -1025,7 +809,7 @@ class Akismet {
 		if ( is_user_logged_in() )
 			return false;
 	
-		return ( get_option( 'akismet_strictness' ) === '1' );
+		return ( get_option( 'akismet_strictness' ) === '1'  );
 	}
 
 	public static function get_ip_address() {
@@ -1175,12 +959,10 @@ class Akismet {
 		if ( ! empty( self::$prevent_moderation_email_for_these_comments ) && ! empty( $emails ) ) {
 			$comment = get_comment( $comment_id );
 
-			if ( $comment ) {
-				foreach ( self::$prevent_moderation_email_for_these_comments as $possible_match ) {
-					if ( self::comments_match( $possible_match, $comment ) ) {
-						update_comment_meta( $comment_id, 'akismet_delayed_moderation_email', true );
-						return array();
-					}
+			foreach ( self::$prevent_moderation_email_for_these_comments as $possible_match ) {
+				if ( self::comments_match( $possible_match, $comment ) ) {
+					update_comment_meta( $comment_id, 'akismet_delayed_moderation_email', true );
+					return array();
 				}
 			}
 		}
@@ -1311,112 +1093,47 @@ class Akismet {
 
 	// given a response from an API call like check_key_status(), update the alert code options if an alert is present.
 	public static function update_alert( $response ) {
-		$alert_option_prefix = 'akismet_alert_';
-		$alert_header_prefix = 'x-akismet-alert-';
-		$alert_header_names  = array(
-			'code',
-			'msg',
-			'api-calls',
-			'usage-limit',
-			'upgrade-plan',
-			'upgrade-url',
-			'upgrade-type',
-		);
+		$code = $msg = null;
+		if ( isset( $response[0]['x-akismet-alert-code'] ) ) {
+			$code = $response[0]['x-akismet-alert-code'];
+			$msg  = $response[0]['x-akismet-alert-msg'];
+		}
 
-		foreach ( $alert_header_names as $alert_header_name ) {
-			$value = null;
-			if ( isset( $response[0][ $alert_header_prefix . $alert_header_name ] ) ) {
-				$value = $response[0][ $alert_header_prefix . $alert_header_name ];
+		// only call update_option() if the value has changed
+		if ( $code != get_option( 'akismet_alert_code' ) ) {
+			if ( ! $code ) {
+				delete_option( 'akismet_alert_code' );
+				delete_option( 'akismet_alert_msg' );
 			}
-
-			$option_name = $alert_option_prefix . str_replace( '-', '_', $alert_header_name );
-			if ( $value != get_option( $option_name ) ) {
-				if ( ! $value ) {
-					delete_option( $option_name );
-				} else {
-					update_option( $option_name, $value );
-				}
+			else {
+				update_option( 'akismet_alert_code', $code );
+				update_option( 'akismet_alert_msg', $msg );
 			}
 		}
 	}
 
 	public static function load_form_js() {
-		/* deprecated */
+		wp_register_script( 'akismet-form', plugin_dir_url( __FILE__ ) . '_inc/form.js', array(), AKISMET_VERSION, true );
+		wp_enqueue_script( 'akismet-form' );
 	}
-
-	public static function set_form_js_async( $tag, $handle, $src ) {
-		/* deprecated */
-		return $tag;
-	}
-
-	public static function get_akismet_form_fields() {
-		$fields = '';
-
-		$prefix = 'ak_';
-
-		// Contact Form 7 uses _wpcf7 as a prefix to know which fields to exclude from comment_content.
-		if ( 'wpcf7_form_elements' === current_filter() ) {
-			$prefix = '_wpcf7_ak_';
-		}
-
-		$fields .= '<p style="display: none !important;">';
-		$fields .= '<label>&#916;<textarea name="' . $prefix . 'hp_textarea" cols="45" rows="8" maxlength="100"></textarea></label>';
-
-		if ( ! function_exists( 'amp_is_request' ) || ! amp_is_request() ) {
-			// Keep track of how many ak_js fields are in this page so that we don't re-use
-			// the same ID.
-			static $field_count = 0;
-
-			$field_count++;
-
-			$fields .= '<input type="hidden" id="ak_js_' . $field_count . '" name="' . $prefix . 'js" value="' . mt_rand( 0, 250 ) . '"/>';
-			$fields .= '<script>document.getElementById( "ak_js_' . $field_count . '" ).setAttribute( "value", ( new Date() ).getTime() );</script>';
-		}
-
-		$fields .= '</p>';
-
-		return $fields;
-	}
-
-	public static function output_custom_form_fields( $post_id ) {
-		// phpcs:ignore WordPress.Security.EscapeOutput
-		echo self::get_akismet_form_fields();
-	}
-
-	public static function inject_custom_form_fields( $html ) {
-		$html = str_replace( '</form>', self::get_akismet_form_fields() . '</form>', $html );
-
-		return $html;
-	}
-
-	public static function append_custom_form_fields( $html ) {
-		$html .= self::get_akismet_form_fields();
-
-		return $html;
-	}
-
+	
 	/**
-	 * Ensure that any Akismet-added form fields are included in the comment-check call.
-	 *
-	 * @param array $form
-	 * @return array $form
+	 * Mark form.js as async. Because nothing depends on it, it can run at any time
+	 * after it's loaded, and the browser won't have to wait for it to load to continue
+	 * parsing the rest of the page.
 	 */
-	public static function prepare_custom_form_values( $form ) {
-		$prefix = 'ak_';
-
-		// Contact Form 7 uses _wpcf7 as a prefix to know which fields to exclude from comment_content.
-		if ( 'wpcf7_akismet_parameters' === current_filter() ) {
-			$prefix = '_wpcf7_ak_';
+	public static function set_form_js_async( $tag, $handle, $src ) {
+		if ( 'akismet-form' !== $handle ) {
+			return $tag;
 		}
-
-		// phpcs:ignore WordPress.Security.NonceVerification.Missing
-		foreach ( $_POST as $key => $val ) {
-			if ( 0 === strpos( $key, $prefix ) ) {
-				$form[ 'POST_ak_' . substr( $key, strlen( $prefix ) ) ] = $val;
-			}
-		}
-
-		return $form;
+		
+		return preg_replace( '/^<script /i', '<script async="async" ', $tag );
+	}
+	
+	public static function inject_ak_js( $fields ) {
+		echo '<p style="display: none;">';
+		echo '<input type="hidden" id="ak_js" name="ak_js" value="' . mt_rand( 0, 250 ) . '"/>';
+		echo '</p>';
 	}
 
 	private static function bail_on_activation( $message, $deactivate = true ) {
@@ -1424,7 +1141,7 @@ class Akismet {
 <!doctype html>
 <html>
 <head>
-<meta charset="<?php bloginfo( 'charset' ); ?>" />
+<meta charset="<?php bloginfo( 'charset' ); ?>">
 <style>
 * {
 	text-align: center;
@@ -1437,7 +1154,6 @@ p {
 	font-size: 18px;
 }
 </style>
-</head>
 <body>
 <p><?php echo esc_html( $message ); ?></p>
 </body>
@@ -1486,8 +1202,6 @@ p {
 			$message = '<strong>'.sprintf(esc_html__( 'Akismet %s requires WordPress %s or higher.' , 'akismet'), AKISMET_VERSION, AKISMET__MINIMUM_WP_VERSION ).'</strong> '.sprintf(__('Please <a href="%1$s">upgrade WordPress</a> to a current version, or <a href="%2$s">downgrade to version 2.4 of the Akismet plugin</a>.', 'akismet'), 'https://codex.wordpress.org/Upgrading_WordPress', 'https://wordpress.org/extend/plugins/akismet/download/');
 
 			Akismet::bail_on_activation( $message );
-		} elseif ( ! empty( $_SERVER['SCRIPT_NAME'] ) && false !== strpos( $_SERVER['SCRIPT_NAME'], '/wp-admin/plugins.php' ) ) {
-			add_option( 'Activated_Akismet', true );
 		}
 	}
 
@@ -1542,138 +1256,63 @@ p {
 		if ( $method !== 'pingback.ping' )
 			return;
 
-		// A lot of this code is tightly coupled with the IXR class because the xmlrpc_call action doesn't pass along any information besides the method name.
-		// This ticket should hopefully fix that: https://core.trac.wordpress.org/ticket/52524
-		// Until that happens, when it's a system.multicall, pre_check_pingback will be called once for every internal pingback call.
-		// Keep track of how many times this function has been called so we know which call to reference in the XML.
-		static $call_count = 0;
-
-		$call_count++;
-
 		global $wp_xmlrpc_server;
-
+	
 		if ( !is_object( $wp_xmlrpc_server ) )
 			return false;
+	
+		// Lame: tightly coupled with the IXR class.
+		$args = $wp_xmlrpc_server->message->params;
+	
+		if ( !empty( $args[1] ) ) {
+			$post_id = url_to_postid( $args[1] );
 
-		$is_multicall = false;
-		$multicall_count = 0;
-
-		if ( 'system.multicall' === $wp_xmlrpc_server->message->methodName ) {
-			$is_multicall = true;
-
-			if ( 0 === $call_count ) {
-				// Only pass along the number of entries in the multicall the first time we see it.
-				$multicall_count = count( $wp_xmlrpc_server->message->params );
-			}
-
-			/*
-			 * $wp_xmlrpc_server->message looks like this:
-			 *
-				(
-					[message] =>
-					[messageType] => methodCall
-					[faultCode] =>
-					[faultString] =>
-					[methodName] => system.multicall
-					[params] => Array
-						(
-							[0] => Array
-								(
-									[methodName] => pingback.ping
-									[params] => Array
-										(
-											[0] => http://www.example.net/?p=1 // Site that created the pingback.
-											[1] => https://www.example.com/?p=1 // Post being pingback'd on this site.
-										)
-								)
-							[1] => Array
-								(
-									[methodName] => pingback.ping
-									[params] => Array
-										(
-											[0] => http://www.example.net/?p=1 // Site that created the pingback.
-											[1] => https://www.example.com/?p=2 // Post being pingback'd on this site.
-										)
-								)
-						)
-				)
-			 */
-
-			// Use the params from the nth pingback.ping call in the multicall.
-			$pingback_calls_found = 0;
-
-			foreach ( $wp_xmlrpc_server->message->params as $xmlrpc_action ) {
-				if ( 'pingback.ping' === $xmlrpc_action['methodName'] ) {
-					$pingback_calls_found++;
-				}
-
-				if ( $call_count === $pingback_calls_found ) {
-					$pingback_args = $xmlrpc_action['params'];
-					break;
-				}
-			}
-		} else {
-			/*
-			 * $wp_xmlrpc_server->message looks like this:
-			 *
-				(
-					[message] =>
-					[messageType] => methodCall
-					[faultCode] =>
-					[faultString] =>
-					[methodName] => pingback.ping
-					[params] => Array
-						(
-							[0] => http://www.example.net/?p=1 // Site that created the pingback.
-							[1] => https://www.example.com/?p=2 // Post being pingback'd on this site.
-						)
-				)
-			 */
-			$pingback_args = $wp_xmlrpc_server->message->params;
-		}
-
-		if ( ! empty( $pingback_args[1] ) ) {
-			$post_id = url_to_postid( $pingback_args[1] );
-
-			// If pingbacks aren't open on this post, we'll still check whether this request is part of a potential DDOS,
-			// but indicate to the server that pingbacks are indeed closed so we don't include this request in the user's stats,
-			// since the user has already done their part by disabling pingbacks.
-			$pingbacks_closed = false;
-			
-			$post = get_post( $post_id );
-			
-			if ( ! $post || ! pings_open( $post ) ) {
-				$pingbacks_closed = true;
-			}
-
-			// Note: If is_multicall is true and multicall_count=0, then we know this is at least the 2nd pingback we've processed in this multicall.
+			// If this gets through the pre-check, make sure we properly identify the outbound request as a pingback verification
+			Akismet::pingback_forwarded_for( null, $args[0] );
+			add_filter( 'http_request_args', array( 'Akismet', 'pingback_forwarded_for' ), 10, 2 );
 
 			$comment = array(
-				'comment_author_url' => $pingback_args[0],
+				'comment_author_url' => $args[0],
 				'comment_post_ID' => $post_id,
 				'comment_author' => '',
 				'comment_author_email' => '',
 				'comment_content' => '',
 				'comment_type' => 'pingback',
 				'akismet_pre_check' => '1',
-				'comment_pingback_target' => $pingback_args[1],
-				'pingbacks_closed' => $pingbacks_closed ? '1' : '0',
-				'is_multicall' => $is_multicall,
-				'multicall_count' => $multicall_count,
+				'comment_pingback_target' => $args[1],
 			);
 
-			$comment = self::auto_check_comment( $comment, 'xml-rpc' );
+			$comment = Akismet::auto_check_comment( $comment );
 
 			if ( isset( $comment['akismet_result'] ) && 'true' == $comment['akismet_result'] ) {
-				// Sad: tightly coupled with the IXR classes. Unfortunately the action provides no context and no way to return anything.
+				// Lame: tightly coupled with the IXR classes. Unfortunately the action provides no context and no way to return anything.
 				$wp_xmlrpc_server->error( new IXR_Error( 0, 'Invalid discovery target' ) );
-
-				// Also note that if this was part of a multicall, a spam result will prevent the subsequent calls from being executed.
-				// This is probably fine, but it raises the bar for what should be acceptable as a false positive.
 			}
 		}
 	}
+	
+	public static function pingback_forwarded_for( $r, $url ) {
+		static $urls = array();
+	
+		// Call this with $r == null to prime the callback to add headers on a specific URL
+		if ( is_null( $r ) && !in_array( $url, $urls ) ) {
+			$urls[] = $url;
+		}
 
+		// Add X-Pingback-Forwarded-For header, but only for requests to a specific URL (the apparent pingback source)
+		if ( is_array( $r ) && is_array( $r['headers'] ) && !isset( $r['headers']['X-Pingback-Forwarded-For'] ) && in_array( $url, $urls ) ) {
+			$remote_ip = preg_replace( '/[^a-fx0-9:.,]/i', '', $_SERVER['REMOTE_ADDR'] );
+		
+			// Note: this assumes REMOTE_ADDR is correct, and it may not be if a reverse proxy or CDN is in use
+			$r['headers']['X-Pingback-Forwarded-For'] = $remote_ip;
+
+			// Also identify the request as a pingback verification in the UA string so it appears in logs
+			$r['user-agent'] .= '; verifying pingback from ' . $remote_ip;
+		}
+
+		return $r;
+	}
+	
 	/**
 	 * Ensure that we are loading expected scalar values from akismet_as_submitted commentmeta.
 	 *
@@ -1688,17 +1327,8 @@ p {
 		$meta_value = (array) $meta_value;
 
 		foreach ( $meta_value as $key => $value ) {
-			if ( ! is_scalar( $value ) ) {
-				unset( $meta_value[ $key ] );
-			} else {
-				// These can change, so they're not explicitly listed in comment_as_submitted_allowed_keys.
-				if ( strpos( $key, 'POST_ak_' ) === 0 ) {
-					continue;
-				}
-
-				if ( ! isset( self::$comment_as_submitted_allowed_keys[ $key ] ) ) {
-					unset( $meta_value[ $key ] );
-				}
+			if ( ! isset( self::$comment_as_submitted_allowed_keys[$key] ) || ! is_scalar( $value ) ) {
+				unset( $meta_value[$key] );
 			}
 		}
 
@@ -1711,22 +1341,5 @@ p {
 		}
 		
 		return apply_filters( 'akismet_predefined_api_key', false );
-	}
-
-	/**
-	 * Controls the display of a privacy related notice underneath the comment form using the `akismet_comment_form_privacy_notice` option and filter respectively.
-	 * Default is top not display the notice, leaving the choice to site admins, or integrators.
-	 */
-	public static function display_comment_form_privacy_notice() {
-		if ( 'display' !== apply_filters( 'akismet_comment_form_privacy_notice', get_option( 'akismet_comment_form_privacy_notice', 'hide' ) ) ) {
-			return;
-		}
-		echo apply_filters(
-			'akismet_comment_form_privacy_notice_markup',
-			'<p class="akismet_comment_form_privacy_notice">' . sprintf(
-				__( 'This site uses Akismet to reduce spam. <a href="%s" target="_blank" rel="nofollow noopener">Learn how your comment data is processed</a>.', 'akismet' ),
-				'https://akismet.com/privacy/'
-			) . '</p>'
-		);
 	}
 }

@@ -3,16 +3,7 @@
 (function ($, _, Backbone) {
 	'use strict';
 
-	/** @namespace wp */
-	window.wp = window.wp || {};
-
-	var WPPlaylistView = Backbone.View.extend(/** @lends WPPlaylistView.prototype */{
-		/**
-		 * @constructs
-		 *
-		 * @param {Object} options          The options to create this playlist view with.
-		 * @param {Object} options.metadata The metadata
-		 */
+	var WPPlaylistView = Backbone.View.extend({
 		initialize : function (options) {
 			this.index = 0;
 			this.settings = {};
@@ -68,7 +59,9 @@
 				this.settings.success = this.bindResetPlayer;
 			}
 
-			// This is also our bridge to the outside world.
+			/**
+			 * This is also our bridge to the outside world
+			 */
 			this.player = new MediaElementPlayer( this.playerNode.get(0), this.settings );
 		},
 
@@ -171,32 +164,11 @@
 		}
 	});
 
-	/**
-	 * Initialize media playlists in the document.
-	 *
-	 * Only initializes new playlists not previously-initialized.
-	 *
-	 * @since 4.9.3
-	 * @return {void}
-	 */
-	function initialize() {
-		$( '.wp-playlist:not(:has(.mejs-container))' ).each( function() {
-			new WPPlaylistView( { el: this } );
+    $(document).ready(function () {
+		$('.wp-playlist').each( function() {
+			return new WPPlaylistView({ el: this });
 		} );
-	}
-
-	/**
-	 * Expose the API publicly on window.wp.playlist.
-	 *
-	 * @namespace wp.playlist
-	 * @since 4.9.3
-	 * @type {object}
-	 */
-	window.wp.playlist = {
-		initialize: initialize
-	};
-
-	$( document ).ready( initialize );
+    });
 
 	window.WPPlaylistView = WPPlaylistView;
 
